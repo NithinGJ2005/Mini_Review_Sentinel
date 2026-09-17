@@ -135,19 +135,19 @@ All reviewed file contents and paths are hashed with SHA-256 into a 16-character
 1. **Description**: Common libraries implement methods named `.eval()` (e.g. PyTorch `model.eval()`) or `.execute()` (e.g. background job runner `worker.execute()`).
 2. **Naive failure mode**: Crude regex or substring matching flags any occurrence of `eval(` as dangerous arbitrary code execution and any `.execute(` as SQL injection.
 3. **Our implementation**: AST analysis checks the node type: built-in `eval()` is an `ast.Name(id='eval')`, whereas method calls are `ast.Attribute(attr='eval')`. Non-SQL `.execute()` calls without dynamic SQL strings are safely ignored.
-4. **Test**: `test_hidden_case_safe_object_methods_eval_execute` in [tests/test_review.py](file:///c:/Users/Nithin%20G%20J/Downloads/mini_review_sentinel/mini_review_sentinel/tests/test_review.py).
+4. **Test**: `test_hidden_case_safe_object_methods_eval_execute` in [tests/test_review.py](tests/test_review.py).
 
 ### Hidden Case 2: SQL injection via `%` modulo interpolation
 1. **Description**: Queries constructed with Python `%` string formatting syntax before execution (e.g. `cursor.execute("SELECT * FROM users WHERE id = %s" % user_id)`).
 2. **Naive failure mode**: Reviewers checking only f-strings or string concatenation (`+`) miss `ast.BinOp` with `ast.Mod`, allowing dangerous dynamic queries to pass undetected.
 3. **Our implementation**: The AST visitor inspects `ast.BinOp` with `ast.Mod` specifically targeting SQL execution sinks while leaving normal arithmetic and logging formatting untouched.
-4. **Test**: `test_sql_injection_mod_operator_detected` and `test_safe_non_sql_mod_operator` in [tests/test_review.py](file:///c:/Users/Nithin%20G%20J/Downloads/mini_review_sentinel/mini_review_sentinel/tests/test_review.py).
+4. **Test**: `test_sql_injection_mod_operator_detected` and `test_safe_non_sql_mod_operator` in [tests/test_review.py](tests/test_review.py).
 
 ### Hidden Case 3: Environment variable lookups vs hard-coded secrets
 1. **Description**: Code loading credentials securely via `os.environ.get("API_KEY")`, `os.getenv("SECRET_KEY")`, or `os.environ["DB_PASS"]`.
 2. **Naive failure mode**: Secret scanners matching variable names like `api_key = ...` flag the lookup itself because the variable name resembles a credential key.
 3. **Our implementation**: Regex pattern requires literal quoted string assignments with concrete length thresholds, preventing function calls or dictionary access from being falsely reported.
-4. **Test**: `test_environment_variables_not_flagged_as_secrets` in [tests/test_review.py](file:///c:/Users/Nithin%20G%20J/Downloads/mini_review_sentinel/mini_review_sentinel/tests/test_review.py).
+4. **Test**: `test_environment_variables_not_flagged_as_secrets` in [tests/test_review.py](tests/test_review.py).
 
 ## Install
 
