@@ -1,63 +1,130 @@
 # Design Decisions
 
-## A. Static vs LLM disagreement
+## A. Static vs LLM Disagreement
 
-### Static HIGH, LLM LOW
+**Simple explanation:**
+Deterministic static checks act as the non-negotiable security baseline. When hard evidence in the source code shows a high-risk security flaw, the LLM cannot override it. If the LLM suspects a contextual business-logic problem that static checks missed, a human must review it.
 
-`REJECTED`.
+**What happens:**
+- Static HIGH + LLM LOW → `REJECTED`
+- Static LOW + LLM HIGH → `REVIEW_REQUIRED`
 
-The static rule is deterministic and reproducible. For the three mandatory security checks, an LLM should not be allowed to talk the system out of evidence that is directly observable in the syntax/AST.
+**Why:**
+- Deterministic analysis inspects concrete syntax (such as dynamic SQL interpolation or hardcoded secrets). If that vulnerability is physically present in the code, an LLM must not be allowed to talk the system out of observable evidence.
+- An LLM can spot subtle business-logic flaws that static rules cannot catch. Because LLM reasoning is probabilistic rather than mathematically proven, its findings escalate to human review instead of triggering automatic rejection.
 
-### Static LOW, LLM HIGH
+**Technical note:**
+The conflict resolution policy in `resolve()` enforces deterministic checks as an absolute security floor while using the LLM as an advisory detector for broader context.
 
-`REVIEW_REQUIRED`.
+---
 
-An LLM can notice contextual business-logic problems that a narrow deterministic rule cannot. Because that signal is probabilistic, it escalates to human review instead of causing an automatic rejection.
+## B. LLM Failure
 
-## B. LLM failure
+**Simple explanation:**
+If the LLM is unreachable, times out, or encounters network errors, the review does not crash. ReviewSentinel falls back to deterministic static analysis alone so security checks remain dependable.
 
-The review continues with deterministic analysis. If there are no medium/high deterministic findings, the system may approve, but the result records that the LLM was unavailable.
+**What happens:**
+- If static analysis finds HIGH risk → `REJECTED`
+- If static analysis finds MEDIUM risk → `REVIEW_REQUIRED`
+- If static analysis finds NO issues → `APPROVED` (with an explicit note stating the LLM was unavailable)
 
-This is a deliberate fail-safe for a small assignment: security checks remain available even when the external dependency is down.
+**Why:**
+Security gating should never completely stop simply because an external cloud API is down. Critical security vulnerabilities (`eval()`, SQL injection, hardcoded credentials) can still be caught locally and reliably by static analysis.
 
-## C. LLM output validation
+**Technical note:**
+`ReviewEngine` catches all provider exceptions, records `llm_available = False`, and preserves the note in the final audit trail without losing static findings.
 
-The provider adapter requires a JSON object. Findings must contain the expected fields and enum values. Malformed JSON or unexpected shapes raise a controlled exception that is converted into an LLM-unavailable path. Raw model text is never directly used as the decision.
+---
 
-## D. Agent termination
+## C. LLM Output Validation
 
-`MAX_ITERATIONS = 2` is a hard upper bound. A repeated identical context request is also blocked. Therefore the engine cannot enter an unbounded review/context/re-review loop.
+**Simple explanation:**
+The system never trusts raw text output from an AI model. All model responses must follow a strict, structured JSON schema before being processed.
 
-## E. False positives
+**What happens:**
+- Valid JSON matching our schema → Findings are parsed, bound to decisions, and merged.
+- Malformed JSON, markdown chatter, or unexpected values → The parser catches the error, marks the LLM as unavailable, and safely continues with deterministic analysis.
 
-A difficult false positive is distinguishing harmless occurrences of security-related terms from genuine vulnerabilities. 
+**Why:**
+LLMs are non-deterministic and can produce conversational preamble, missing fields, or invalid enum values. Strict schema validation protects the downstream review pipeline from crashing or corrupting review decisions.
 
-### Why AST is superior to raw string/regex scanning
-1. **Method name collisions**: Libraries like PyTorch define `model.eval()`, and task runners define `worker.execute(task)`. A naive string or regex scanner matches the keywords `eval(` or `execute(` and triggers false-positive code execution or SQL injection rejections. AST analysis inspects Python syntax tree nodes: it verifies whether `eval()` is a bare built-in function invocation (`ast.Name(id='eval')`) or an attribute call on an object (`ast.Attribute(attr='eval')`), safely allowing domain methods.
-2. **SQL structure vs keyword presence**: A query containing the word `SELECT` or `execute` is not vulnerable if it uses parameter placeholders (`?` or `%s`) passed as separate arguments. AST analysis traces whether the query argument into `cursor.execute()` is an expression (`ast.JoinedStr`, `ast.BinOp` with `+` or `%`, `str.format()`) versus a parameterized call (`len(args) >= 2`), eliminating false alarms on safe parameterization.
-3. **Environment lookups vs hardcoded secrets**: Scanners matching variable names like `api_key = ...` often flag `api_key = os.environ.get("API_KEY")`. Our regex requires concrete quoted string literals with minimum length thresholds and excludes standard placeholder prefixes (`mock_`, `dummy_`, `sample_`, `<api_key>`, `test_key_`), preventing false alarms on secure configuration patterns.
+**Technical note:**
+`parse_llm_payload()` extracts JSON objects even when surrounded by markdown code blocks, validates required keys and `Severity` enums, and raises controlled exceptions on invalid structures.
 
-## F. One trade-off: Explicit State Machine vs Multi-Agent Framework
+---
 
-I deliberately chose a small, explicit Python state machine (`MAX_ITERATIONS = 2` loop inside `ReviewEngine`) over introducing a multi-agent orchestration framework (such as LangGraph or AutoGen).
+## D. Agent Termination
 
-### Why this simpler solution was chosen:
-1. **Easier to reason about**: The review lifecycle follows a transparent sequence: initial review -> optional bounded context retrieval -> re-evaluation -> deterministic decision. Every transition has clear, explicit preconditions in plain Python.
-2. **Guaranteed bounded termination**: Multi-agent setups risk complex recursive loops or emergent agent chats. An explicit iteration counter and question deduplication set provide a mathematically provable termination guarantee.
-3. **Deterministic control flow for security**: In security gatekeeping, the decision policy must be reproducible. Frameworks with inter-agent negotiation add non-deterministic variability to critical policy enforcement.
-4. **Simpler failure modes**: When an LLM API times out or emits malformed output, the state machine catches the exception and immediately falls back to deterministic static analysis without orphaned agent state.
-5. **Easier testing and defense**: The state machine operates against clean abstractions (`LLMClient`), allowing comprehensive unit testing with deterministic test doubles (`MockLLM`) that execute in fractions of a second without requiring API keys or heavy dependencies.
+**Simple explanation:**
+The agentic context-gathering loop has strict, hardcoded limits so it can never run indefinitely or consume infinite API tokens.
 
-The trade-off is giving up general-purpose multi-agent choreography in exchange for a lightweight, robust, highly testable, and defensible architecture suited for this assignment.
+**What happens:**
+- The review loop terminates after at most 2 iterations (`MAX_ITERATIONS = 2`).
+- If the model requests the exact same additional context questions, the loop stops immediately.
+
+**Why:**
+Without bounds, an autonomous agent loop can get trapped in recursive re-evaluation or cycle through repeated questions. Hardcoded limits guarantee that review execution always finishes quickly.
+
+**Technical note:**
+`ReviewEngine` tracks an explicit iteration counter against `MAX_ITERATIONS` and maintains a set of hashed question strings (`seen_context_requests`) to break cyclic requests.
+
+---
+
+## E. False Positives
+
+**Simple explanation:**
+ReviewSentinel uses Python Abstract Syntax Tree (AST) analysis rather than naive keyword search. This prevents ordinary, harmless code from being falsely reported as security flaws.
+
+**What happens:**
+- Safe method calls like `model.eval()` or `task.execute()` are ignored.
+- Parameterized SQL queries are recognized as safe.
+- Environment variable lookups are not flagged as hardcoded secrets.
+
+**Why:**
+- **Method name collisions**: A naive regex matching `eval(` flags standard library methods like PyTorch's `model.eval()`. AST analysis checks whether `eval()` is a bare built-in function call or an attribute method on an object.
+- **SQL parameterization**: The detector inspects the query argument passed to `cursor.execute()`. If the query is constructed using dynamic string formatting (f-strings, `+` concatenation, `%` interpolation, or `.format()`), it is flagged as unsafe. If the query is a static string literal using parameter placeholders (`?` or `%s`) with values passed separately, it is recognized as safe.
+- **Secrets vs Environment variables**: Scanners looking for `api_key = ...` often flag `api_key = os.getenv("API_KEY")`. ReviewSentinel requires literal quoted strings and explicitly ignores standard placeholder prefixes (`test_key_`, `mock_`, `dummy_`, `<api_key>`).
+
+**Technical note:**
+AST parsing evaluates code structure (`ast.Call`, `ast.JoinedStr`, `ast.Constant`) instead of raw text matches, eliminating common false alarms.
+
+---
+
+## F. One Trade-off: Explicit State Machine vs Multi-Agent Framework
+
+**Simple explanation:**
+We chose a small, explicit Python state machine (`MAX_ITERATIONS = 2`) over a complex multi-agent framework (like LangGraph or AutoGen).
+
+**What happens:**
+- The review follows an explicit sequence: static scan → initial LLM review → optional bounded context retrieval → final decision.
+- There are no background agent negotiations or unpredictable conversational loops.
+
+**Why:**
+- **Easy to reason about**: The entire lifecycle is plain Python with clear preconditions and transitions.
+- **Guaranteed termination**: Mathematical certainty that the review finishes in at most 2 cycles.
+- **Deterministic security decisions**: Security gatekeeping requires reproducible, consistent outcomes.
+- **Fast and testable**: No heavy frameworks or background workers, allowing all 40 unit and integration tests to run in seconds without external services.
+
+**Technical note:**
+Clean abstractions (`LLMClient`) allow deterministic testing with test doubles (`MockLLM`) that verify every transition without live API keys.
+
+---
 
 ## G. Lightweight Repository Acquisition vs GitHub API Integration
 
-Remote Git support was implemented via a lightweight, subprocess-based repository-acquisition layer rather than integrating with the GitHub REST/GraphQL API.
+**Simple explanation:**
+To support Git repositories, ReviewSentinel uses a lightweight local clone command instead of integrating with the GitHub REST API.
 
-### Why this approach was chosen:
-1. **Repository input requirement**: The goal is evaluating repository source code, which only requires obtaining the repository files on disk.
-2. **Cloning is sufficient**: Standard shallow cloning (`git clone --depth 1`) retrieves the exact working tree needed for source analysis across any Git host (GitHub, GitLab, Bitbucket, self-hosted), not just GitHub.
-3. **No GitHub API authentication required**: Avoids requiring GitHub personal access tokens, OAuth flows, rate limiting constraints, or network API schemas.
-4. **Source code focus**: The reviewer evaluates source code AST and semantics, not Git commit metadata, pull request comments, or issues.
-5. **Simplicity and testability**: Isolating repository acquisition as an input adapter cleanly decouples source retrieval from review logic. This makes the architecture straightforward to test locally (using local file/git URLs) with zero external network or service dependencies.
+**What happens:**
+- The repository is cloned into a temporary working directory via `git clone --depth 1`.
+- The Python files are discovered and reviewed as local data.
+- The temporary directory is completely removed immediately after review finishes.
 
+**Why:**
+- **Repository input requirement**: ReviewSentinel evaluates source code files, not pull request metadata, issues, or commit histories.
+- **Universal compatibility**: Shallow cloning works across GitHub, GitLab, Bitbucket, and self-hosted Git servers without provider-specific code.
+- **Zero authentication overhead**: Does not require setting up GitHub personal access tokens, managing OAuth, or handling API rate limits.
+- **Data safety**: The repository remains passive data—no repository code (`setup.py`, `Makefile`, shell scripts) is ever executed.
+
+**Technical note:**
+`app/git_repo.py` manages shallow cloning with disabled hooks and disabled prompts, guarantees cleanup on Windows despite read-only packfiles, and translates clone failures into clean errors without tracebacks.
